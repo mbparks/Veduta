@@ -306,7 +306,7 @@ dialog .dfoot{padding:12px 16px;border-top:1px solid var(--rule);display:flex;ga
 
 <header id="masthead">
   <span id="wordmark">Veduta</span>
-  <span id="plateno">FI-239 · v2.0.0</span>
+  <span id="plateno">FI-239 · v2.0.2</span>
   <span id="subtitle">cartographic plate press · local-first</span>
   <span id="proofstate">no cargo</span>
   <button id="doorbtn" type="button">Bench</button>
@@ -327,6 +327,7 @@ dialog .dfoot{padding:12px 16px;border-top:1px solid var(--rule);display:flex;ga
     <div id="easysizes"></div>
 
     <button id="easygo" class="primary">Press the plate</button>
+    <button id="easycancel" style="display:none;width:100%;margin-top:8px">Cancel</button>
     <div class="bar" style="margin-top:12px"><i id="easybar"></i></div>
     <div class="hint" id="easystat"></div>
 
@@ -427,6 +428,7 @@ dialog .dfoot{padding:12px 16px;border-top:1px solid var(--rule);display:flex;ga
         <div class="row" style="margin-top:14px">
           <button id="fetchbtn" class="primary">Fetch cargo</button>
           <button id="showqbtn">Show the query</button>
+          <button id="cancelfetch" style="display:none">Cancel</button>
           <button id="checkconn">Check the connection</button>
           <button id="clearcargo">Discard cargo</button>
         </div>
@@ -1018,10 +1020,19 @@ function currentBBox(){
   return bboxForRadius(S.fix.lat, S.fix.lon, rx, ry);
 }
 
+/* Some layers have no Overpass filter because they only ever come from a
+   file — contours are drawn from a GeoJSON you supply. They are still real
+   layers with a checkbox, so they arrive here mixed in with the rest, and
+   iterating a filter that does not exist throws a TypeError that looks
+   exactly like a blocked fetch by the time it reaches the error handler.
+   Fetchable layers are the ones with filters; that is the whole test. */
+function fetchableLayers(keys){
+  return keys.filter(k => Array.isArray(LAYER_FILTERS[k]) && LAYER_FILTERS[k].length);
+}
 function buildQuery(bbox, layerKeys, timeout){
   const b = `${bbox.s.toFixed(6)},${bbox.w.toFixed(6)},${bbox.n.toFixed(6)},${bbox.e.toFixed(6)}`;
   const lines = [];
-  for (const k of layerKeys){
+  for (const k of fetchableLayers(layerKeys)){
     for (const f of LAYER_FILTERS[k]) lines.push("  " + f + "(" + b + ");");
   }
   return `[out:json][timeout:${timeout || 180}];\n(\n${lines.join("\n")}\n);\nout geom;`;
@@ -1046,12 +1057,18 @@ function bboxAreaKm2(b){
   return Math.abs(h * w);
 }
 
+/* Splitting is not free: every extra tile is another round trip and another
+   deliberate pause between them, and four requests for a county's worth of
+   rural road is four chances to be told to come back later. Overpass takes a
+   few hundred square kilometres of roads without blinking; the thresholds
+   here were set an order of magnitude too low and turned a one-request job
+   into a four-request one. */
 function tilesNeeded(bbox, layerKeys){
   let a = bboxAreaKm2(bbox);
-  if (layerKeys.includes("buildings")) a *= 5;   // buildings are the expensive one
-  if (a < 90)  return 1;
-  if (a < 360) return 2;
-  if (a < 900) return 3;
+  if (layerKeys.includes("buildings")) a *= 6;   // buildings really are the expensive one
+  if (a < 400)  return 1;
+  if (a < 1600) return 2;
+  if (a < 4000) return 3;
   return 4;
 }
 
@@ -1070,9 +1087,18 @@ function classifyFetchError(e){
   return { kind: "server", msg: e && e.message ? e.message : "refused" };
 }
 
+let ACTIVE_FETCH = null;          // the controller for the request in flight
+let FETCH_CANCELLED = false;
+
+function cancelFetch(){
+  FETCH_CANCELLED = true;
+  if (ACTIVE_FETCH) try { ACTIVE_FETCH.abort(); } catch (e){}
+}
+
 async function askOverpass(ep, query, method, timeoutMs){
   const ctrl = typeof AbortController !== "undefined" ? new AbortController() : null;
-  const timer = ctrl ? setTimeout(() => ctrl.abort(), timeoutMs || 90000) : null;
+  ACTIVE_FETCH = ctrl;
+  const timer = ctrl ? setTimeout(() => ctrl.abort(), timeoutMs || 75000) : null;
   try {
     const opts = { signal: ctrl ? ctrl.signal : undefined,
                    headers: { "Accept": "application/json" } };
@@ -1087,7 +1113,7 @@ async function askOverpass(ep, query, method, timeoutMs){
     const r = await fetch(url, opts);
     if (!r.ok) throw new Error("HTTP " + r.status + (r.status === 406 ? " (this instance is turning tool traffic away)" : ""));
     return await r.json();
-  } finally { if (timer) clearTimeout(timer); }
+  } finally { if (timer) clearTimeout(timer); ACTIVE_FETCH = null; }
 }
 
 async function overpassFetch(query, onProgress){
@@ -1095,12 +1121,14 @@ async function overpassFetch(query, onProgress){
   let sawBlocked = 0, sawServer = 0;
   for (const ep of OVERPASS){
     for (const method of ["POST", "GET"]){
+      if (FETCH_CANCELLED) throw Object.assign(new Error("Cancelled"), { cancelled: true });
       try {
         if (onProgress) onProgress(`asking ${ep.name} by ${method}`);
         const j = await askOverpass(ep, query, method);
         S.lastEndpoint = ep.name + " (" + method + ")";
         return j;
       } catch (e){
+        if (FETCH_CANCELLED) throw Object.assign(new Error("Cancelled"), { cancelled: true });
         const c = classifyFetchError(e);
         tried.push(`${ep.name} ${method}: ${c.msg}`);
         if (c.kind === "blocked") sawBlocked++; else sawServer++;
@@ -1459,9 +1487,13 @@ function splitRoadsAtJunctions(feats){
 }
 
 /* ---------------- the fetch run ---------------- */
-async function runFetch(){
-  const keys = Object.keys(S.layers).filter(k => S.layers[k].on);
-  if (!keys.length){ toast("Pick at least one layer first.", "bad"); return; }
+async function runFetch(report){
+  const keys = fetchableLayers(Object.keys(S.layers).filter(k => S.layers[k].on));
+  if (!keys.length){
+    toast("Pick at least one layer that comes from the map data. Contours are loaded from a file, not fetched.", "bad");
+    return;
+  }
+  FETCH_CANCELLED = false;
 
   const bbox = currentBBox();
   const n = tilesNeeded(bbox, keys);
@@ -1471,17 +1503,33 @@ async function runFetch(){
   const btn = $("#fetchbtn");
   btn.disabled = true;
   const bar = $("#fetchbar");
-  const say = t => { $("#fetchstatus").innerHTML = t; };
+  // The front door cannot see the bench's status line, so every message goes
+  // to both. A progress report nobody can read is the same as none.
+  const say = t => { $("#fetchstatus").innerHTML = t; if (report) report(t); };
+  const t0 = performance.now();
+  const tick = setInterval(() => {
+    if (!liveMsg) return;
+    const s = Math.round((performance.now() - t0) / 1000);
+    const el = $("#fetchelapsed");
+    if (el) el.textContent = s + "s";
+    if (report) report(liveMsg + ` <span style="color:var(--text-faint)">· ${s}s</span>`);
+  }, 1000);
+  let liveMsg = "";
+  $("#cancelfetch").style.display = "";
 
   say(`Fetching ${keys.length} layer${keys.length>1?"s":""} in ${boxes.length} request${boxes.length>1?"s":""}…`);
   note(`fetch start · ${keys.join(",")} · ${boxes.length} request(s) · bbox ${bbox.s.toFixed(4)},${bbox.w.toFixed(4)},${bbox.n.toFixed(4)},${bbox.e.toFixed(4)}`);
 
   try {
     for (let i = 0; i < boxes.length; i++){
-      const q = buildQuery(boxes[i], keys, 180);
+      const q = buildQuery(boxes[i], keys, 70);   // matched to the client abort
       queries.push(q);
-      say(`Request ${i+1} of ${boxes.length} — <span class="warn">working</span>`);
-      const json = await overpassFetch(q, m => say(`Request ${i+1} of ${boxes.length} — ${m}`));
+      liveMsg = `Request ${i+1} of ${boxes.length} — <span class="warn">working</span>`;
+      say(liveMsg + ` <span id="fetchelapsed" style="color:var(--text-faint)"></span>`);
+      const json = await overpassFetch(q, m => {
+        liveMsg = `Request ${i+1} of ${boxes.length} — ${m}`;
+        say(liveMsg + ` <span id="fetchelapsed" style="color:var(--text-faint)"></span>`);
+      });
       const f = normaliseOverpass(json);
       all.push(...f);
       bar.style.width = ((i+1)/boxes.length*100) + "%";
@@ -1495,12 +1543,19 @@ async function runFetch(){
     S.cargoMeta = { at: new Date().toISOString(), queries, bbox, source: "Overpass API",
                     requests: boxes.length };
     countCargo();
-    say(`<span class="good">Aboard.</span> ${S.features.length.toLocaleString()} features from ${boxes.length} request${boxes.length>1?"s":""} via ${esc(S.lastEndpoint || "an instance")}.`);
+    liveMsg = "";
+    say(`<span class="good">Aboard.</span> ${S.features.length.toLocaleString()} features from ${boxes.length} request${boxes.length>1?"s":""} via ${esc(S.lastEndpoint || "an instance")} in ${Math.round((performance.now()-t0)/1000)}s.`);
     note(`fetch ok · ${S.features.length} features`);
     toast(`${S.features.length.toLocaleString()} features aboard.`, "good");
     S.displayList = null; S.proofDrawnFrom = null;
     refreshAll();
   } catch (e){
+    liveMsg = "";
+    if (e.cancelled){
+      say(`Cancelled. Nothing was changed — the cargo you had is still aboard.`);
+      note("fetch cancelled");
+      throw e;
+    }
     const detail = (e.tried || []).map(t => "  " + esc(t)).join("<br>");
     say(`<span class="bad">${esc(e.message)}.</span>` +
         (e.allBlocked
@@ -1517,8 +1572,12 @@ async function runFetch(){
     if (pb) pb.onclick = runProbe;
     note("fetch failed · " + e.message);
     toast(e.message, "bad");
+    throw e;                      // the front door needs to know it failed
   } finally {
+    liveMsg = "";
+    clearInterval(tick);
     btn.disabled = false;
+    $("#cancelfetch").style.display = "none";
     setTimeout(() => bar.style.width = "0%", 1200);
   }
 }
@@ -4225,6 +4284,7 @@ async function runEasy(){
   if (!q && !EASY.fix){ easySay(`<span class="bad">Type a place first.</span>`, 0); return; }
   const btn = $("#easygo");
   btn.disabled = true;
+  const started = Date.now();
   try {
     if (q){
       easySay("Looking up the place…", 8);
@@ -4241,15 +4301,18 @@ async function runEasy(){
 
     const size = EASY_SIZES.find(s => s.key === EASY.size);
     S.extent.pw = size.mm[0]; S.extent.ph = size.mm[1];
-    S.extent.radius = 6000; S.extent.dpi = 300;
+    S.extent.radius = 4000; S.extent.dpi = 300;   // one request's worth, not four
     applyPreset(EASY.preset);
     S.style.rampMode = "highway";
     for (const k in S.layers) S.layers[k].on = ["roads","water","waterway","places"].includes(k);
     pushStateToUI();
 
     easySay("Fetching the map…", 25);
-    await runFetch();
-    if (!S.features.length) throw new Error("no map data came back — try the bench, the query is there under Cargo");
+    $("#easycancel").style.display = "";
+    // pass the reporter through so the front door shows the same progress the
+    // bench does, elapsed seconds and all
+    await runFetch(msg => easySay(msg, 25 + 45 * Math.min(1, (Date.now() - started) / 45000)));
+    if (!S.features.length) throw new Error("the fetch succeeded but came back empty — try a different place, or open the bench and check the layers at Cargo");
 
     easySay("Drawing…", 80);
     await new Promise(r => setTimeout(r, 30));
@@ -4264,8 +4327,19 @@ async function runEasy(){
     updateFlags();
     note("easy plate · " + short);
   } catch (e){
-    easySay(`<span class="bad">${esc(e.message)}</span>`, 0);
-  } finally { btn.disabled = false; }
+    if (e.cancelled){
+      easySay(`Cancelled.`, 0);
+    } else {
+      easySay(`<span class="bad">${esc(e.message)}</span>` +
+        (e.allBlocked
+          ? `<br>Nothing reached the network at all. If this page is running inside a preview pane, save the file and open it from disk.`
+          : ``) +
+        `<br><span style="color:var(--text-faint)">The bench has the full story under Cargo, including the query to run by hand.</span>`, 0);
+    }
+  } finally {
+    btn.disabled = false;
+    $("#easycancel").style.display = "none";
+  }
 }
 function easySay(html, pct){
   $("#easystat").innerHTML = html;
@@ -4428,7 +4502,9 @@ function buildLayerPicks(){
     const d = document.createElement("div");
     d.className = "checkline";
     d.style.marginBottom = "6px";
-    d.innerHTML = `<input type="checkbox" id="lay-${k}" ${l.on?"checked":""}><label for="lay-${k}" style="text-transform:none;letter-spacing:0">${l.label}</label>`;
+    const fileOnly = !Array.isArray(LAYER_FILTERS[k]);
+    d.innerHTML = `<input type="checkbox" id="lay-${k}" ${l.on?"checked":""}><label for="lay-${k}" style="text-transform:none;letter-spacing:0">${l.label}` +
+      (fileOnly ? ` <span style="color:var(--text-faint)">— from a file, not fetched</span>` : "") + `</label>`;
     d.querySelector("input").onchange = e => {
       S.layers[k].on = e.target.checked;
       S.displayList = null; S.proofDrawnFrom = null;
@@ -5372,6 +5448,26 @@ function selfTest(){
   });
   T("bbox · big areas get split", () => tilesNeeded(bboxForRadius(39,-78,25000,25000), ["roads"]) > 1 ? true : "not split");
 
+  T("query · a file-only layer never reaches the query", () => {
+    const q = buildQuery({s:0,w:0,n:1,e:1}, ["roads","contours"], 90);
+    return (q.includes('way["highway"]') && !/undefined/.test(q)) ? true : q.slice(0,80);
+  });
+  T("query · asking for only file-only layers builds an empty selection, not a crash", () => {
+    try { const q = buildQuery({s:0,w:0,n:1,e:1}, ["contours"], 90);
+          return q.includes("out geom;") ? true : "malformed"; }
+    catch (e){ return "threw: " + e.message; }
+  });
+  T("query · the fetchable set drops what cannot be fetched", () => {
+    const f = fetchableLayers(["roads","contours","water"]);
+    return (f.length === 2 && f.indexOf("contours") === -1) ? true : f.join(",");
+  });
+  T("query · every layer with a checkbox either has a filter or is marked file-only", () => {
+    for (const k in S.layers)
+      if (!Array.isArray(LAYER_FILTERS[k]) && !S.layers[k].fileOnly)
+        return k + " has no filter and is not flagged file-only";
+    return true;
+  });
+
   T("query · names every requested layer and closes properly", () => {
     const q = buildQuery({s:0,w:0,n:1,e:1}, ["roads","water"], 90);
     return (q.includes('way["highway"]') && q.includes('natural"="water') && q.trim().endsWith("out geom;")) ? true : q.slice(0,60);
@@ -5817,7 +5913,7 @@ function boot(){
 
   $("#fetchbtn").onclick = runFetch;
   $("#showqbtn").onclick = () => {
-    $("#qtext").value = buildQuery(currentBBox(), Object.keys(S.layers).filter(k => S.layers[k].on), 180);
+    $("#qtext").value = buildQuery(currentBBox(), fetchableLayers(Object.keys(S.layers).filter(k => S.layers[k].on)), 70);
     $("#qdlg").showModal();
   };
   $("#qcopy").onclick = () => { navigator.clipboard.writeText($("#qtext").value); toast("Query copied.", "good"); };
@@ -5891,6 +5987,8 @@ function boot(){
   $("#hatchang").oninput = e => { S.style.hatch.angle = Number(e.target.value)||0; styleTouch(); };
 
   $("#checkconn").onclick = runProbe;
+  $("#cancelfetch").onclick = cancelFetch;
+  $("#easycancel").onclick = cancelFetch;
   $("#loadosmbtn").onclick = () => $("#osmfile").click();
   $("#osmfile").onchange = async e => {
     const f = e.target.files[0]; if (!f) return;
@@ -6049,7 +6147,7 @@ function boot(){
   refreshAll();
   go("fix");
   setDoor("easy");
-  note("veduta v2.0.0 started");
+  note("veduta v2.0.2 started");
 }
 /* Top-level `const` does not attach to the window in a classic script, so the
    state object is exported explicitly. The self-test harness reads it, and so
